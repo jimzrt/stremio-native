@@ -1,0 +1,103 @@
+name: Downmix Linux binary release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name
+        required: false
+        default: "1.0.6"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  release:
+    name: Build and publish Linux binary
+    runs-on: ubuntu-latest
+    env:
+      VERSION_NAME: ${{ inputs.version_name }}
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+      VCPKG_DEFAULT_TRIPLET: x64-linux-v3-static-release
+      VCPKGRS_TRIPLET: x64-linux-v3-static-release
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlays
+      PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-v3-static-release/lib/pkgconfig
+      LIBTORRENT_STATIC: "1"
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/downmix
+          submodules: recursive
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build pkg-config \
+            libssl-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev \
+            libmpv-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev \
+            libwayland-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Export GitHub Actions cache environment for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+          vcpkgJsonGlob: vcpkg.json
+          runVcpkgInstall: true
+      - name: Build
+        run: |
+          mv .cargo/config.toml .cargo/config.toml.disabled
+          trap 'mv .cargo/config.toml.disabled .cargo/config.toml' EXIT
+          RUSTUP_TOOLCHAIN=stable cargo build --locked --release --package stremio-native
+
+      - name: Package binary asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stremio-native
+          cp target/release/stremio-native dist/stremio-native/
+          sed -e 's/Stremio Native (Devel)/Stremio Native (Downmix)/' \
+              -e 's/com.stremio.StremioNative.Devel/com.stremio.StremioNative.Downmix/g' \
+              flatpak/com.stremio.StremioNative.Devel.desktop \
+              > dist/stremio-native/stremio-native-downmix.desktop
+          cp app/ui/assets/images/stremio-logo.svg dist/stremio-native/stremio-native-downmix.svg
+          tar -C dist/stremio-native -czf "dist/stremio-native-${VERSION_NAME}-x86_64.tar.gz" .
+          rm -rf dist/stremio-native
+          (cd dist && sha256sum "stremio-native-${VERSION_NAME}-x86_64.tar.gz" > SHA256SUMS.txt)
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="downmix-${VERSION_NAME}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target feature/downmix \
+              --title "Stremio Native downmix ${VERSION_NAME}" \
+              --notes "Linux x86_64 binary for the dialogue downmix feature."
+          fi
+          gh release upload "${tag}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber

@@ -1,0 +1,20 @@
+pkgname=stremio-native-downmix-bin
+pkgver=1.0.6
+pkgrel=2
+pkgdesc="Community-native Stremio desktop client with multichannel dialogue downmixing (prebuilt)"
+arch=('x86_64')
+url="https://github.com/jimzrt/stremio-native"
+license=('GPL-3.0-only')
+depends=('mpv' 'libtorrent-rasterbar' 'boost' 'gtk3' 'libayatana-appindicator' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcb' 'openssl')
+provides=('stremio-native')
+conflicts=('stremio-native' 'stremio-native-git' 'stremio-native-downmix-git')
+source=("https://github.com/jimzrt/stremio-native/releases/download/downmix-${pkgver}/stremio-native-${pkgver}-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 stremio-native "${pkgdir}/usr/bin/stremio-native"
+    install -Dm644 stremio-native-downmix.desktop \
+        "${pkgdir}/usr/share/applications/stremio-native-downmix.desktop"
+    install -Dm644 stremio-native-downmix.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/stremio-native-downmix.svg"
+}
