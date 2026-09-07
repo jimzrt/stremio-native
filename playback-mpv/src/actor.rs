@@ -25,6 +25,36 @@ use crate::{
 };
 
 const ADD_SUBTITLE_COMMAND_REPLY_ID: u64 = 1;
+const DIALOGUE_DOWNMIX_FILTER: &str = "lavfi=[pan=stereo|FL=0.50*FL+0.85*FC+0.20*LFE+0.35*BL+0.35*SL|FR=0.50*FR+0.85*FC+0.20*LFE+0.35*BR+0.35*SR,acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=1.5,alimiter=limit=0.95:level=0]";
+
+const DOWNMIXED_SUFFIX: &str = " (Downmixed)";
+
+fn downmix_source_id(track_id: &str) -> Option<String> {
+    let id = track_id.parse::<i64>().ok()?;
+    if id < 0 {
+        id.checked_neg().map(|value| value.to_string())
+    } else {
+        None
+    }
+}
+
+fn synthetic_downmix_track(source: &AudioTrack) -> Option<AudioTrack> {
+    let source_id = source.id.parse::<i64>().ok()?;
+    if source_id <= 0 || source.channels.unwrap_or(0) <= 2 {
+        return None;
+    }
+    let mut downmixed = source.clone();
+    downmixed.id = (-source_id).to_string();
+    downmixed.title = Some(
+        match source.title.as_deref().filter(|title| !title.is_empty()) {
+            Some(title) => format!("{title}{DOWNMIXED_SUFFIX}"),
+            None => "Downmixed".to_owned(),
+        },
+    );
+    downmixed.channels = Some(2);
+    downmixed.selected = false;
+    Some(downmixed)
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioTrack {
@@ -33,6 +63,7 @@ pub struct AudioTrack {
     pub language: Option<String>,
     pub codec: Option<String>,
     pub selected: bool,
+    pub channels: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -964,11 +995,6 @@ impl SpatialAudioRuntime {
     }
 
     fn recenter_head(&self) -> Result<(), MpvError> {
-        if !self.omniphony_available() {
-            return Err(MpvError::InvalidNode(
-                "Omniphony head tracking is unavailable".to_owned(),
-            ));
-        }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| {
             MpvError::InvalidNode(format!("could not bind Omniphony control socket: {error}"))
         })?;
@@ -991,9 +1017,26 @@ fn reselect_audio_track(
     let Some(active_audio_track) = active_audio_track.filter(|track| *track != "no") else {
         return Ok(());
     };
+    let downmixed = downmix_source_id(active_audio_track).is_some();
+    let source_id =
+        downmix_source_id(active_audio_track).unwrap_or_else(|| active_audio_track.to_owned());
     client
         .set_string("aid", "no")
-        .and_then(|()| client.set_string("aid", active_audio_track))
+        .and_then(|()| client.set_string("aid", &source_id))
+        .and_then(|()| {
+            if !downmixed {
+                return Ok(());
+            }
+            let current_filter = client.get_string("af").unwrap_or_default();
+            client
+                .set_string("audio-channels", "stereo")
+                .and_then(|()| {
+                    client.set_string(
+                        "af",
+                        &append_filter(&current_filter, DIALOGUE_DOWNMIX_FILTER),
+                    )
+                })
+        })
 }
 
 fn prepend_decoder(base: &str, decoder: &str) -> String {
@@ -1009,6 +1052,12 @@ fn prepend_decoder(base: &str, decoder: &str) -> String {
 fn append_filter(base: &str, filter: &str) -> String {
     if base.trim().is_empty() {
         filter.to_owned()
+    } else if base == filter
+        || base
+            .strip_suffix(filter)
+            .is_some_and(|prefix| prefix.ends_with(','))
+    {
+        base.to_owned()
     } else {
         format!("{base},{filter}")
     }
@@ -1288,6 +1337,11 @@ fn handle_command(
             let hdr_passthrough_available = state.hdr_passthrough_available;
             let spatial_audio_requested = state.spatial_audio_requested;
             let spatial_audio_applied = state.spatial_audio_applied;
+            let reset_audio = state
+                .active_audio_track
+                .as_deref()
+                .and_then(downmix_source_id)
+                .is_some();
             *state = PlaybackState {
                 loading: true,
                 paused: false,
@@ -1299,7 +1353,15 @@ fn handle_command(
             };
             sink(PlaybackEvent::State(Arc::new(state.clone())));
             let file_options = load_file_options(&url, start_at);
-            set_optional_double(client, "ab-loop-a", None)
+            let reset_result = if reset_audio {
+                spatial_audio
+                    .restore_base(client)
+                    .and_then(|()| spatial_audio.configure(client, spatial_audio_applied))
+            } else {
+                Ok(())
+            };
+            reset_result
+                .and_then(|()| set_optional_double(client, "ab-loop-a", None))
                 .and_then(|()| set_optional_double(client, "ab-loop-b", None))
                 .and_then(|()| match file_options {
                     Some(options) => client.command(&["loadfile", &url, "replace", "-1", &options]),
@@ -1336,7 +1398,48 @@ fn handle_command(
             _ => client.set_flag("keepaspect", false),
         },
         PlaybackCommand::SetAudioTrack(track) => {
-            client.set_string("aid", track.as_deref().unwrap_or("no"))
+            let previous_downmix = state
+                .active_audio_track
+                .as_deref()
+                .and_then(downmix_source_id)
+                .is_some();
+            let downmix_source = track.as_deref().and_then(downmix_source_id);
+            state.active_audio_track = track
+                .as_deref()
+                .filter(|track| *track != "no" && *track != "auto")
+                .map(ToOwned::to_owned);
+            if let Some(source_id) = downmix_source {
+                let current_filter = client.get_string("af").unwrap_or_default();
+                client
+                    .set_string("audio-channels", "stereo")
+                    .and_then(|()| {
+                        client.set_string(
+                            "af",
+                            &append_filter(&current_filter, DIALOGUE_DOWNMIX_FILTER),
+                        )
+                    })
+                    .and_then(|()| client.set_string("aid", &source_id))
+            } else if previous_downmix {
+                spatial_audio
+                    .apply(
+                        client,
+                        state.spatial_audio_requested,
+                        state.loaded,
+                        state.active_audio_track.as_deref(),
+                    )
+                    .map(|resolution| {
+                        state.spatial_audio_applied = resolution.applied;
+                    })
+                    .and_then(|()| {
+                        if state.active_audio_track.is_none() {
+                            client.set_string("aid", track.as_deref().unwrap_or("no"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+            } else {
+                client.set_string("aid", track.as_deref().unwrap_or("no"))
+            }
         }
         PlaybackCommand::SetSubtitleTrack(track) => {
             if track.as_ref() == state.active_secondary_subtitle_track.as_ref() {
@@ -1732,7 +1835,18 @@ fn update_property(event: &MpvEvent, state: &mut PlaybackState) -> PropertyUpdat
         }
         "mute" => state.muted = property_flag(property).unwrap_or(state.muted),
         "speed" => state.speed = property_double(property).unwrap_or(state.speed),
-        "aid" => state.active_audio_track = property_track_id(property),
+        "aid" => {
+            let source_id = property_track_id(property);
+            let synthetic_matches = state
+                .active_audio_track
+                .as_deref()
+                .and_then(downmix_source_id)
+                .as_deref()
+                == source_id.as_deref();
+            if !synthetic_matches {
+                state.active_audio_track = source_id;
+            }
+        }
         "sid" => state.active_subtitle_track = property_track_id(property),
         "secondary-sid" => state.active_secondary_subtitle_track = property_track_id(property),
         "filename" => state.filename = property_string(property),
@@ -1847,6 +1961,60 @@ fn property_node(property: &MpvEventProperty) -> Option<&MpvNode> {
     }
 }
 
+#[cfg(test)]
+mod downmix_tests {
+    use super::{
+        AudioTrack, DIALOGUE_DOWNMIX_FILTER, append_filter, downmix_source_id,
+        synthetic_downmix_track,
+    };
+
+    #[test]
+    fn multichannel_audio_gets_one_labeled_downmix_option() {
+        let source = AudioTrack {
+            id: "2".to_owned(),
+            title: Some("Surround 5.1".to_owned()),
+            language: Some("eng".to_owned()),
+            codec: Some("ac3".to_owned()),
+            selected: true,
+            channels: Some(6),
+        };
+
+        let downmixed = synthetic_downmix_track(&source).expect("multichannel track");
+        assert_eq!(downmixed.id, "-2");
+        assert_eq!(downmixed.title.as_deref(), Some("Surround 5.1 (Downmixed)"));
+        assert_eq!(downmixed.language.as_deref(), Some("eng"));
+        assert_eq!(downmixed.channels, Some(2));
+        assert!(!downmixed.selected);
+    }
+
+    #[test]
+    fn stereo_audio_does_not_get_a_downmix_option() {
+        let source = AudioTrack {
+            id: "1".to_owned(),
+            channels: Some(2),
+            ..AudioTrack::default()
+        };
+        assert!(synthetic_downmix_track(&source).is_none());
+    }
+
+    #[test]
+    fn negative_track_ids_map_to_their_source_ids() {
+        assert_eq!(downmix_source_id("-7").as_deref(), Some("7"));
+        assert_eq!(downmix_source_id("7"), None);
+    }
+    #[test]
+    fn downmix_filter_is_not_duplicated_when_tracks_are_reselected() {
+        assert_eq!(
+            append_filter(DIALOGUE_DOWNMIX_FILTER, DIALOGUE_DOWNMIX_FILTER),
+            DIALOGUE_DOWNMIX_FILTER
+        );
+        assert_eq!(
+            append_filter("lavfi=[other]", DIALOGUE_DOWNMIX_FILTER),
+            format!("lavfi=[other],{DIALOGUE_DOWNMIX_FILTER}")
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{PlaybackRuntime, PlayerConfig, hardware_decoding_option};
@@ -1902,6 +2070,7 @@ fn parse_tracks(node: &MpvNode) -> (Vec<AudioTrack>, Vec<SubtitleTrack>) {
         let mut language = None;
         let mut codec = None;
         let mut selected = false;
+        let mut channels = None;
         let mut external = false;
         let mut source_url = None;
         for index in 0..len {
@@ -1925,6 +2094,7 @@ fn parse_tracks(node: &MpvNode) -> (Vec<AudioTrack>, Vec<SubtitleTrack>) {
                 b"title" => title = node_string(value),
                 b"lang" => language = node_string(value),
                 b"codec" => codec = node_string(value),
+                b"audio-channels" => channels = node_int(value),
                 b"selected" => selected = node_flag(value).unwrap_or(false),
                 b"external" => external = node_flag(value).unwrap_or(false),
                 b"external-filename" => source_url = node_string(value),
@@ -1934,13 +2104,20 @@ fn parse_tracks(node: &MpvNode) -> (Vec<AudioTrack>, Vec<SubtitleTrack>) {
 
         let Some(id) = id else { continue };
         match kind {
-            Some(TrackKind::Audio) => audio.push(AudioTrack {
-                id,
-                title,
-                language,
-                codec,
-                selected,
-            }),
+            Some(TrackKind::Audio) => {
+                let track = AudioTrack {
+                    id,
+                    title,
+                    language,
+                    codec,
+                    selected,
+                    channels,
+                };
+                audio.push(track.clone());
+                if let Some(downmixed) = synthetic_downmix_track(&track) {
+                    audio.push(downmixed);
+                }
+            }
             Some(TrackKind::Subtitle) => subtitles.push(SubtitleTrack {
                 id,
                 title,
